@@ -15,7 +15,8 @@ Material de estudio basado en las preguntas de repaso del proyecto GambleBitCoin
 7. [¿Qué funcionalidad tiene Spark en el proyecto?](#7-qué-funcionalidad-tiene-spark-en-el-proyecto)
 8. [Funcionalidad de SRC y sus Instancias](#8-funcionalidad-de-src-y-sus-instancias)
 9. [Cómo Funciona Docker y Funcionalidad de sus Contenedores](#10-cómo-funciona-docker-y-funcionalidad-de-sus-contenedores)
-10. [Anexos](#11-anexos)
+10. [Flujo Completo de Datos](#11-flujo-completo-de-datos)
+11. [Anexos](#12-anexos)
 
 ---
 
@@ -1074,6 +1075,351 @@ Los contenedores se comunican internamente usando los nombres definidos en `cont
 
 ---
 
-## 11) Anexos
+## 11) Flujo Completo de Datos
+
+### Diagrama General del Flujo:
+
+```
+[Binance API WebSocket]
+        |
+        v
+[Python Producer: binance_kafka_producer.py]
+        | (envía JSON: {symbol, price, ts, source})
+        v
+[Kafka Topic: market.prices.raw] (3 particiones)
+        |
+        +---> [Node.js Consumer: kafkaStreamConsumer.js]
+        |         |
+        |         v
+        |    [MarketService.onPriceTick()]
+        |         |
+        |         +---> Actualiza this.state[symbol].latestPrice
+        |         |
+        |         +---> Emite vía Socket.IO: "price_update"
+        |         |
+        |         +---> Verifica rondas: settleRound()
+        |         |
+        |         +---> Envía a Kafka: market.round.events, market.bets.events
+        |         |
+        |         v
+        |    [Frontend: Socket.IO client] → Actualiza gráfica Chart.js
+        |
+        +---> [Spark Streaming: spark_processor.py] (OPCIONAL - No en Docker)
+                  |
+                  +---> Ventanas de 1 min: min, max, avg price
+                  +---> Ventanas de 30 seg: count y sum de apuestas
+                  +---> Detección de spikes (>2% en 30 seg)
+                  +---> Reportes de tendencia (UP/DOWN/HOLD)
+                  |
+                  +---> Sinks: Console, CSV, Kafka (market.alerts)
+```
+
+---
+
+### 11.1) PRODUCER - Python Binance WebSocket
+
+**Archivo:** `src/streams/binance_kafka_producer.py` (133 líneas)
+
+**Flujo:**
+1. **Conexión:** `AsyncClient` + `BinanceSocketManager` conectan a Binance WebSocket
+2. **Streams:** Escucha `ethusdt@trade`, `solusdt@trade`, `bnbusdt@trade`
+3. **Conversión:** `to_tick(message)` extrae: `{symbol, price, ts, source: "binance_trade"}`
+4. **Envío:** `producer.send(TOPIC, value=tick)` a Kafka topic `market.prices.raw`
+
+**Código clave (líneas 57-86):**
+```python
+async def stream_once(symbols, producer):
+    client = await AsyncClient.create(api_key=API_KEY, api_secret=API_SECRET)
+    bsm = BinanceSocketManager(client)
+    streams = [f"{symbol}@trade" for symbol in symbols]
+    socket = bsm.multiplex_socket(streams)
+    
+    async with socket as stream:
+        while not SHOULD_STOP:
+            message = await asyncio.wait_for(stream.recv(), timeout=WS_TIMEOUT)
+            tick = to_tick(message.get("data"))
+            if tick:
+                producer.send(TOPIC, key=tick["symbol"].encode("utf-8"), value=tick)
+```
+
+**Configuración desde `.env`:**
+```env
+BINANCE_API_KEY=tu_api_key
+BINANCE_API_SECRET=tu_api_secret
+BINANCE_TLD=com
+BINANCE_WS_TIMEOUT=30
+KAFKA_BROKERS=localhost:9092
+KAFKA_PRICE_TOPIC=market.prices.raw
+```
+
+---
+
+### 11.2) KAFKA - Message Broker
+
+**Contenedor:** `kafka-1` (Confluent Kafka 7.5.0)
+
+**Topics configurados:**
+| Topic | Propósito | Particiones | Productor | Consumidor |
+|-------|-----------|-------------|-----------|------------|
+| `market.prices.raw` | Precios en tiempo real | 3 | Python Binance | Node.js, Spark |
+| `market.bets.events` | Eventos de apuestas | 3 | Node.js (betService) | Spark |
+| `market.round.events` | Eventos de rondas | 3 | Node.js (marketService) | Spark |
+| `market.alerts` | Alertas de anomalías | 3 | Spark, Node.js | Node.js (frontend) |
+
+**Configuración clave (docker-compose.yml líneas 24-32):**
+```yaml
+KAFKA_BROKER_ID: 1
+KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+KAFKA_NUM_PARTITIONS: 3
+```
+
+**Listeners:**
+- `localhost:9092` - Para aplicaciones en el HOST
+- `kafka:29092` - Para contenedores Docker internos
+
+---
+
+### 11.3) KAFKA CONSUMER - Node.js
+
+**Archivo:** `src/streams/kafkaStreamConsumer.js` (51 líneas)
+
+**Flujo:**
+1. Crea consumidor: `kafkaMirror.createConsumer(groupId)`
+2. Se suscribe a topics: `market.prices.raw`, `market.alerts`
+3. Por cada mensaje: `JSON.parse(message.value)` → `onMessage(topic, payload)`
+
+**Código clave (líneas 12-35):**
+```javascript
+async start() {
+  this.consumer = this.kafkaMirror.createConsumer(this.groupId);
+  await this.consumer.connect();
+  for (const topic of this.topics) {
+    await this.consumer.subscribe({ topic, fromBeginning: false });
+  }
+  
+  await this.consumer.run({
+    eachMessage: async ({ topic, message }) => {
+      const raw = message.value ? message.value.toString() : "";
+      const payload = JSON.parse(raw);
+      this.onMessage(topic, payload); // Callback definido en app.js
+    },
+  });
+}
+```
+
+**Callback en app.js (líneas 149-165):**
+```javascript
+onMessage: (topic, payload) => {
+  if (topic === config.kafkaPriceTopic) {
+    marketService.onPriceTick({
+      symbol: payload.symbol,
+      price: payload.price,
+      ts: payload.ts,
+      source: payload.source,
+    });
+  }
+  if (topic === config.kafkaAlertsTopic) {
+    io.emit("anomaly_alert", payload); // Alerta al frontend
+  }
+}
+```
+
+---
+
+### 11.4) MARKET SERVICE - Procesamiento de Precios
+
+**Archivo:** `src/services/marketService.js` (~320 líneas)
+
+**Flujo de `onPriceTick()`:**
+1. Actualiza estado: `this.state[symbol].latestPrice = price`
+2. Actualiza timestamp: `this.state[symbol].latestPriceTs = ts`
+3. Emite a frontend: `io.to(room).emit("price_update", {symbol, price, timestamp})`
+4. Verifica rondas: Si `now >= round.endAt` → `settleRound(symbol)`
+
+**Código clave:**
+```javascript
+onPriceTick({ symbol, price, ts, source }) {
+  const market = this.state[symbol];
+  market.latestPrice = price;
+  market.latestPriceTs = ts;
+  
+  // Emitir a todos los clientes suscritos
+  this.io.to(this.room(symbol)).emit("price_update", {
+    symbol,
+    price,
+    timestamp: ts,
+    source,
+  });
+}
+```
+
+**Ciclo de ronda (startRoundLoop):**
+```javascript
+startRoundLoop() {
+  setInterval(async () => {
+    for (const symbol of this.symbols) {
+      const round = this.state[symbol].currentRound;
+      
+      // Bloquear apuestas a los 15 segundos
+      if (!round.locked && now >= round.lockAt) {
+        round.locked = true;
+        this.io.emit("round_locked", {...});
+      }
+      
+      // Resolver ronda a los 20 segundos
+      if (now >= round.endAt) {
+        await this.settleRound(symbol);
+      }
+    }
+  }, 1000);
+}
+```
+
+---
+
+### 11.5) SPARK STREAMING - Análisis de Datos (OPCIONAL)
+
+**Archivo:** `spark/spark_processor.py` (387 líneas)
+
+**Nota importante:** Spark NO está incluido en `docker-compose.yml`. Es una herramienta **separada** para análisis de datos.
+
+**Flujo:**
+1. **Lee de Kafka:** `spark.readStream.format("kafka").load()`
+2. **Parsea JSON:** Convierte a DataFrame con columnas (symbol, price, ts, source)
+3. **Agrega por ventanas:**
+   - Precios: 1 minuto (min, max, avg)
+   - Apuestas: 30 segundos deslizantes (count, sum)
+   - Spikes: 30 segundos (detecta >2% cambio)
+   - Tendencia: 1 minuto (UP/DOWN/HOLD)
+4. **Escribe a múltiples sinks:**
+   - **Consola:** Imprime métricas en tiempo real
+   - **CSV:** `data/metrics_prices/`, `data/alerts/`
+   - **Kafka:** Envía alertas a `market.alerts`
+
+**Código clave (líneas 78-100):**
+```python
+# Leer precios de Kafka
+price_stream = (spark.readStream.format("kafka")
+    .option("subscribe", PRICE_TOPIC).load())
+
+# Parsear y convertir timestamp
+prices = (price_stream.selectExpr("CAST(value AS STRING) as json")
+    .select(from_json(col("json"), price_schema).alias("data"))
+    .select("data.*")
+    .withColumn("event_time", (col("ts") / 1000).cast("timestamp")))
+
+# Ventana de 1 minuto con watermark
+price_windows = (prices.withWatermark("event_time", "2 minutes")
+    .groupBy(window(col("event_time"), "1 minute"), col("symbol"))
+    .agg(spark_min("price"), spark_max("price"), spark_avg("price")))
+```
+
+**Cómo ejecutar Spark (NO está en Docker):**
+```bash
+# Instalar dependencias
+pip install pyspark kafka-python
+
+# Ejecutar
+python spark/spark_processor.py
+```
+
+---
+
+### 11.6) SOCKET.IO - Tiempo Real al Frontend
+
+**Archivo:** `src/sockets/registerSocketHandlers.js`
+
+**Eventos emitidos por el servidor:**
+| Evento | Propósito | Disparador |
+|--------|-----------|------------|
+| `price_update` | Actualiza gráfica de precios | MarketService |
+| `round_open` | Nueva ronda abierta | MarketService |
+| `round_locked` | Apuestas bloqueadas (últimos 5s) | MarketService |
+| `round_result` | Resultado de la ronda | MarketService |
+| `bet_placed` | Nueva apuesta realizada | BetService |
+| `chat_update` | Nuevo mensaje de chat | ChatService |
+| `leaderboard_updated` | Ranking actualizado | LeaderboardService |
+| `anomaly_alert` | Alerta de spike de precio | app.js (Kafka alerts) |
+
+**Eventos recibidos del cliente:**
+| Evento | Propósito |
+|--------|-----------|
+| `subscribe_market` | Suscribe a un símbolo (se une a `room:{symbol}`) |
+| `place_bet` | Realiza una apuesta |
+| `chat_message` | Envía mensaje al chat |
+| `get_leaderboard` | Solicita ranking |
+
+---
+
+### 11.7) FRONTEND - Interfaz de Usuario
+
+**Archivos:** `src/public/index.html`, `src/public/client.js`
+
+**Flujo:**
+1. **Carga página:** Se conecta vía Socket.IO: `const socket = io();`
+2. **Suscribe a mercado:** `socket.emit("subscribe_market", {symbol: "ETHUSDT"})`
+3. **Recibe actualizaciones:** `socket.on("price_update", callback)` actualiza Chart.js
+4. **Realiza apuesta:** `socket.emit("place_bet", {roundId, side, amount})`
+5. **Chat en vivo:** `socket.emit("chat_message", {message})`
+
+**Actualización de gráfica:**
+```javascript
+socket.on("price_update", (data) => {
+  updateChart(data.price); // Chart.js
+  updateCurrentPrice(data.price); // Mostrar precio actual
+});
+
+socket.on("round_result", (data) => {
+  showResult(data.result); // Mostrar: UP, DOWN, HOLD
+  updateBalance(data.payouts); // Actualizar saldo
+});
+```
+
+---
+
+### 11.8) Resumen: Quién Consume Qué
+
+| Componente | Consume de | Produce a | Mecanismo |
+|------------|-------------|-----------|------------|
+| **Python Producer** | Binance WebSocket API | Kafka `market.prices.raw` | Kafka Producer |
+| **Node.js Consumer** | Kafka `market.prices.raw`, `market.alerts` | Socket.IO events, Kafka topics | kafkajs |
+| **Spark Streaming** | Kafka `market.prices.raw`, `market.bets.events` | CSV, Console, Kafka `market.alerts` | Spark Structured Streaming |
+| **MarketService** | Node.js Consumer | Socket.IO, Redis, Kafka | Interno |
+| **Frontend** | Socket.IO events | Socket.IO events | socket.io-client |
+| **Kafka UI** | Kafka broker (directo) | - | HTTP Web UI |
+
+---
+
+### 11.9) Flujo de una Apuesta (Ejemplo Completo)
+
+```
+1. Usuario hace clic en "UP" en frontend
+   ↓
+2. Frontend emite: socket.emit("place_bet", {roundId, side:"up", amount:50})
+   ↓
+3. registerSocketHandlers.js recibe evento → betService.placeBet()
+   ↓
+4. BetService valida:
+   - ¿Ronda abierta? (round.status === "open")
+   - ¿No bloqueada? (now < round.lockAt)
+   - ¿Saldo suficiente? (user.balance >= 50)
+   - ¿Monto válido? (10 <= 50 <= 300)
+   ↓
+5. Si pasa validación:
+   - user.debit(50) → resta saldo
+   - repo.saveBet(bet) → guarda en Redis
+   - repo.setUserBalanceAndStatus() → actualiza Redis
+   ↓
+6. Emite a Kafka: kafkaMirror.send("market.bets.events", {type:"bet_placed",...})
+   ↓
+7. Emite a todos: io.to(room).emit("bet_placed", {...})
+   ↓
+8. (Opcional) Spark consume de "market.bets.events" → agrega en ventanas
+```
+
+---
+
+## 12) Anexos
 
 ### URLs del Proyecto:
